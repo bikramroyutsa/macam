@@ -23,6 +23,19 @@ struct MacamApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1000, height: 700)
         .commands {
+            CommandGroup(replacing: .undoRedo) {
+                Button("Undo") {
+                    if let editor = host.editor { editor.undo() } else { NSApp.sendAction(Selector(("undo:")), to: nil, from: nil) }
+                }
+                .keyboardShortcut("z", modifiers: .command)
+                .disabled(host.editor.map { !$0.canUndo } ?? false)
+                Button("Redo") {
+                    if let editor = host.editor { editor.redo() } else { NSApp.sendAction(Selector(("redo:")), to: nil, from: nil) }
+                }
+                .keyboardShortcut("z", modifiers: [.command, .shift])
+                .disabled(host.editor.map { !$0.canRedo } ?? false)
+            }
+
             CommandGroup(replacing: .newItem) {
                 Button("Open Video to Edit…") { host.openPanel() }
                     .keyboardShortcut("o", modifiers: .command)

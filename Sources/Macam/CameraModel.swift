@@ -56,7 +56,10 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     @Published var countdown: Int?
     @Published var timerSeconds: Int = 0
     @Published var mode: CaptureMode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "captureMode") ?? "") ?? .photo {
-        didSet { UserDefaults.standard.set(mode.rawValue, forKey: "captureMode") }
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: "captureMode")
+            if mode == .video { prepareVideo() } else if oldValue == .video { teardownVideo() }
+        }
     }
     @Published var resolution: VideoResolution = VideoResolution(rawValue: UserDefaults.standard.string(forKey: "videoResolution") ?? "") ?? .p1080 {
         didSet { UserDefaults.standard.set(resolution.rawValue, forKey: "videoResolution") }
@@ -74,6 +77,8 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     private let writerQueue = DispatchQueue(label: "macam.camera.writer")
     private let ciContext = CIContext()
     private var audioInput: AVCaptureDeviceInput?
+    private var audioReady = false                 // microphone attached (touched on sessionQueue)
+    private var prepareTask: Task<Void, Never>?
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var audioWriterInput: AVAssetWriterInput?
@@ -115,6 +120,7 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     }
 
     private func configureAndRun() {
+        defer { if mode == .video { prepareVideo() } }
         refreshDevices()
         let preferred = UserDefaults.standard.string(forKey: "cameraID")
         let device = devices.first { $0.uniqueID == preferred } ?? AVCaptureDevice.default(for: .video) ?? devices.first
@@ -135,7 +141,9 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         sessionQueue.async { [self] in
             session.beginConfiguration()
             session.sessionPreset = .photo
-            session.inputs.forEach { session.removeInput($0) }
+            for input in session.inputs where (input as? AVCaptureDeviceInput)?.device.hasMediaType(.video) == true {
+                session.removeInput(input)
+            }
             if let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) {
                 session.addInput(input)
             }
@@ -236,6 +244,55 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
 
     // MARK: Video
 
+    /// Attaches the recording outputs (video frames, microphone) to the running camera session.
+    /// This is done when you switch to video mode, not when you press record: changing a live session
+    /// makes the camera blank for a moment, and that should happen while you're choosing, not filming.
+    private func prepareVideo() {
+        prepareTask?.cancel()
+        prepareTask = Task { @MainActor in
+            let micOK = await AVCaptureDevice.requestAccess(for: .audio)
+            guard !Task.isCancelled else { return }
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                sessionQueue.async { [self] in
+                    defer { c.resume() }
+                    guard session.isRunning || configured else { return }
+                    session.beginConfiguration()
+                    if !session.outputs.contains(videoOutput) {
+                        videoOutput.alwaysDiscardsLateVideoFrames = true
+                        videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+                        videoOutput.setSampleBufferDelegate(self, queue: writerQueue)
+                        if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
+                    }
+                    if micOK, audioInput == nil, let mic = AVCaptureDevice.default(for: .audio),
+                       let input = try? AVCaptureDeviceInput(device: mic), session.canAddInput(input) {
+                        session.addInput(input)
+                        audioInput = input
+                        audioOutput.setSampleBufferDelegate(self, queue: writerQueue)
+                        if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
+                    }
+                    session.commitConfiguration()
+                    audioReady = micOK && audioInput != nil && session.outputs.contains(audioOutput)
+                }
+            }
+        }
+    }
+
+    /// Detaches them again when you go back to photos.
+    private func teardownVideo() {
+        prepareTask?.cancel()
+        sessionQueue.async { [self] in
+            guard session.outputs.contains(videoOutput) || audioInput != nil else { return }
+            session.beginConfiguration()
+            videoOutput.setSampleBufferDelegate(nil, queue: nil)
+            audioOutput.setSampleBufferDelegate(nil, queue: nil)
+            session.removeOutput(videoOutput)
+            session.removeOutput(audioOutput)
+            if let audioInput { session.removeInput(audioInput); self.audioInput = nil }
+            session.commitConfiguration()
+            audioReady = false
+        }
+    }
+
     private func startRecording() {
         guard session.isRunning, !isRecording else { return }
         recordRatio = captureRatio
@@ -244,31 +301,22 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         recordFormat = format
         recordError = nil
         Task { @MainActor in
-            let micOK = await AVCaptureDevice.requestAccess(for: .audio)
+            // Normally ready long before now; only waits if you pressed record straight after switching modes.
+            await self.prepareTask?.value
             let url = Self.movieURL(ext: self.recordFormat.fileExtension)
-            self.sessionQueue.async { [self] in
-                session.beginConfiguration()
-                videoOutput.alwaysDiscardsLateVideoFrames = true
-                videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-                videoOutput.setSampleBufferDelegate(self, queue: writerQueue)
-                if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
-                var audio = false
-                if micOK, let mic = AVCaptureDevice.default(for: .audio),
-                   let input = try? AVCaptureDeviceInput(device: mic), session.canAddInput(input) {
-                    session.addInput(input)
-                    audioInput = input
-                    audioOutput.setSampleBufferDelegate(self, queue: writerQueue)
-                    if session.canAddOutput(audioOutput) { session.addOutput(audioOutput); audio = true }
-                }
-                session.commitConfiguration()
-                writerQueue.async { [self] in
-                    recordURL = url
-                    recordWithAudio = audio
-                    writer = nil
-                    framesSeen = 0
-                    firstFramePTS = nil
-                    wantsRecording = true
-                }
+            let audio = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+                self.sessionQueue.async { c.resume(returning: self.audioReady) }
+            }
+            self.writerQueue.async { [self] in
+                recordURL = url
+                recordWithAudio = audio
+                writer = nil
+                framesSeen = 0
+                firstFramePTS = nil
+                wantsRecording = true
+            }
+            if !audio, AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
+                self.flashNotice("Microphone access is off, so this clip has no sound.")
             }
             withAnimation(.snappy) { self.isRecording = true }
             self.elapsed = 0
@@ -279,6 +327,15 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         }
     }
 
+    @MainActor
+    private func flashNotice(_ message: String) {
+        withAnimation(.snappy) { recordError = message }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(5))
+            if recordError == message { withAnimation(.snappy) { recordError = nil } }
+        }
+    }
+
     func stopRecording() {
         guard isRecording else { return }
         elapsedTimer?.invalidate()
@@ -286,26 +343,14 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         withAnimation(.snappy) { isRecording = false }
         writerQueue.async { [self] in
             wantsRecording = false
-            guard let writer, let url = recordURL else { cleanupOutputs(); return }
+            guard let writer, let url = recordURL else { return }
             self.writer = nil
             videoInput?.markAsFinished()
             audioWriterInput?.markAsFinished()
             writer.finishWriting { [weak self] in
-                self?.cleanupOutputs()
+                // The outputs stay attached: reconfiguring the session now would blank the preview again.
                 Task { @MainActor in await self?.showMovieThumbnail(url) }
             }
-        }
-    }
-
-    private func cleanupOutputs() {
-        sessionQueue.async { [self] in
-            session.beginConfiguration()
-            videoOutput.setSampleBufferDelegate(nil, queue: nil)
-            audioOutput.setSampleBufferDelegate(nil, queue: nil)
-            session.removeOutput(videoOutput)
-            session.removeOutput(audioOutput)
-            if let audioInput { session.removeInput(audioInput); self.audioInput = nil }
-            session.commitConfiguration()
         }
     }
 
@@ -369,7 +414,6 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
                 if recordError == message { withAnimation(.snappy) { recordError = nil } }
             }
         }
-        cleanupOutputs()
     }
 
     private func appendVideo(_ sample: CMSampleBuffer) {
