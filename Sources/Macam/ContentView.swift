@@ -96,6 +96,7 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .animation(.smooth(duration: 0.55), value: profiles.selectedID)
         .animation(.smooth(duration: 0.5), value: showScript)
+        .animation(.smooth(duration: 0.35), value: camera.mode)
         .onAppear {
             camera.start()
             prompter.installNotch()
@@ -196,6 +197,7 @@ struct ContentView: View {
                 HStack(spacing: 2) {
                     if camera.devices.count > 1 { deviceMenu }
                     timerMenu
+                    if camera.mode == .video { resolutionMenu }
                     BarButton(system: "arrow.left.and.right.righttriangle.left.righttriangle.right",
                               active: camera.mirrored, help: "Mirror") {
                         withAnimation(.smooth) { camera.mirrored.toggle() }
@@ -231,6 +233,27 @@ struct ContentView: View {
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
         .help("Camera")
+    }
+
+    private var resolutionMenu: some View {
+        Menu {
+            Picker("Resolution", selection: $camera.resolution) {
+                ForEach(VideoResolution.allCases) { r in
+                    Text("\(r.label)  —  \(r.detail)").tag(r)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Text(camera.resolution.label)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(minWidth: 34, minHeight: 34)
+                .padding(.horizontal, 4)
+                .contentShape(Capsule())
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+        .disabled(camera.isRecording)
+        .transition(.scale(scale: 0.6).combined(with: .opacity))
+        .help("Video resolution")
     }
 
     private var timerMenu: some View {

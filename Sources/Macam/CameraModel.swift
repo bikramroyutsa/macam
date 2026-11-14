@@ -4,6 +4,39 @@ import SwiftUI
 
 enum CaptureMode: String { case photo, video }
 
+/// Video quality, defined by the short side of the frame so every aspect ratio gets the familiar
+/// pixel height: 1080p is 1920×1080 at 16:9, 1440×1080 at 4:3, 1080×1080 at 1:1, 1080×1920 at 9:16.
+/// Never upscales: if the camera can't deliver it, you get the camera's own size.
+enum VideoResolution: String, CaseIterable, Identifiable {
+    case p720, p1080, p2160, native
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .p720: "720p"
+        case .p1080: "1080p"
+        case .p2160: "4K"
+        case .native: "Max"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .p720: "Small files"
+        case .p1080: "Balanced"
+        case .p2160: "Sharpest, large files"
+        case .native: "Full camera resolution"
+        }
+    }
+    var shortSide: CGFloat? {
+        switch self {
+        case .p720: 720
+        case .p1080: 1080
+        case .p2160: 2160
+        case .native: nil
+        }
+    }
+}
+
 final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate,
                          AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
@@ -25,6 +58,9 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     @Published var mode: CaptureMode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "captureMode") ?? "") ?? .photo {
         didSet { UserDefaults.standard.set(mode.rawValue, forKey: "captureMode") }
     }
+    @Published var resolution: VideoResolution = VideoResolution(rawValue: UserDefaults.standard.string(forKey: "videoResolution") ?? "") ?? .p1080 {
+        didSet { UserDefaults.standard.set(resolution.rawValue, forKey: "videoResolution") }
+    }
     @Published var isRecording = false
     @Published var elapsed: TimeInterval = 0
 
@@ -42,6 +78,7 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     private var recordURL: URL?
     private var recordRatio: CGFloat = 16.0 / 9.0
     private var recordMirror = true
+    private var recordResolution: VideoResolution = .p1080
     private var recordWithAudio = false
     private var outSize = CGSize(width: 1920, height: 1080)
     private var elapsedTimer: Timer?
@@ -196,6 +233,7 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         guard session.isRunning, !isRecording else { return }
         recordRatio = captureRatio
         recordMirror = mirrored
+        recordResolution = resolution
         Task { @MainActor in
             let micOK = await AVCaptureDevice.requestAccess(for: .audio)
             let url = Self.movieURL()
@@ -300,16 +338,16 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         if writer == nil {
             guard let url = recordURL else { return }
             let srcW = CGFloat(CVPixelBufferGetWidth(pixels)), srcH = CGFloat(CVPixelBufferGetHeight(pixels))
-            // Fit the crop, then cap the long side at 1920 (even dimensions for the encoder).
+            // Fit the crop, then scale so the short side matches the chosen resolution (even dimensions for the encoder).
             var cw = srcW, ch = srcW / recordRatio
             if ch > srcH { ch = srcH; cw = srcH * recordRatio }
-            let scale = min(1, 1920 / max(cw, ch))
+            let scale = recordResolution.shortSide.map { min(1, $0 / min(cw, ch)) } ?? 1
             let ow = max(2, Int((cw * scale) / 2) * 2), oh = max(2, Int((ch * scale) / 2) * 2)
             outSize = CGSize(width: ow, height: oh)
 
             guard let w = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return }
             let v = AVAssetWriterInput(mediaType: .video, outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoCodecKey: min(ow, oh) > 1080 ? AVVideoCodecType.hevc : AVVideoCodecType.h264,
                 AVVideoWidthKey: ow, AVVideoHeightKey: oh,
                 AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: max(6_000_000, ow * oh * 5)],
             ])
