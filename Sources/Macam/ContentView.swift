@@ -48,6 +48,7 @@ struct ContentView: View {
     @EnvironmentObject var camera: CameraModel
     @EnvironmentObject var profiles: ProfileStore
     @EnvironmentObject var prompter: TeleprompterModel
+    @EnvironmentObject var host: EditorHost
     private var showScript: Bool { prompter.showScript }
 
     private let topInset: CGFloat = 58
@@ -59,6 +60,10 @@ struct ContentView: View {
             VisualEffect().ignoresSafeArea()
             WindowConfigurator().frame(width: 0, height: 0)
 
+            if let editor = host.editor {
+                EditorView(editor: editor, close: { host.close() })
+                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            } else {
             GeometryReader { geo in
                 let rightReserve: CGFloat = showScript ? panelWidth + 16 : 0
                 let avail = CGSize(width: max(100, geo.size.width - 48 - rightReserve),
@@ -92,14 +97,20 @@ struct ContentView: View {
                 }
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             }
+            }
         }
         .preferredColorScheme(.dark)
+        .animation(.smooth(duration: 0.45), value: host.isEditing)
+        .onChange(of: host.isEditing) { _, editing in
+            if editing { camera.pause() } else { camera.resume() }
+        }
         .animation(.smooth(duration: 0.55), value: profiles.selectedID)
         .animation(.smooth(duration: 0.5), value: showScript)
         .animation(.smooth(duration: 0.35), value: camera.mode)
         .onAppear {
             camera.start()
             prompter.installNotch()
+            host.onSaved = { url in camera.registerMovie(url) }
         }
         .onChange(of: profiles.selected.ratio, initial: true) { _, new in camera.captureRatio = new }
     }
@@ -125,6 +136,19 @@ struct ContentView: View {
             case .authorized:
                 CameraPreview(session: camera.session, mirrored: camera.mirrored, deviceID: camera.currentDeviceID)
                 Color.white.opacity(camera.flash ? 1 : 0).allowsHitTesting(false)
+                if let error = camera.recordError {
+                    VStack {
+                        HStack(spacing: 7) {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            Text(error).font(.system(size: 12, weight: .medium))
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .glass(Capsule())
+                        .padding(.top, 14)
+                        Spacer()
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
                 if camera.isRecording {
                     VStack {
                         HStack(spacing: 7) {
@@ -170,7 +194,9 @@ struct ContentView: View {
         HStack(alignment: .center) {
             HStack {
                 if let image = camera.lastPhoto {
-                    Button { camera.revealLastPhoto() } label: {
+                    Button {
+                        if let url = camera.lastPhotoURL, url.isVideoFile { host.open(url) } else { camera.revealLastPhoto() }
+                    } label: {
                         Image(nsImage: image)
                             .resizable().scaledToFill()
                             .frame(width: 46, height: 46)
@@ -178,11 +204,15 @@ struct ContentView: View {
                             .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(.white.opacity(0.25)))
                     }
                     .buttonStyle(.plain)
-                    .help("Show in Finder")
+                    .help(camera.lastPhotoURL?.isVideoFile == true ? "Edit video" : "Show in Finder")
+                    .contextMenu {
+                        if camera.lastPhotoURL != nil { Button("Show in Finder") { camera.revealLastPhoto() } }
+                    }
                     .id(camera.lastPhotoURL)
                     .transition(.scale(scale: 0.5).combined(with: .opacity))
                 }
                 ModeToggle()
+                LibraryButton()
                 Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity)
@@ -197,7 +227,7 @@ struct ContentView: View {
                 HStack(spacing: 2) {
                     if camera.devices.count > 1 { deviceMenu }
                     timerMenu
-                    if camera.mode == .video { resolutionMenu }
+                    if camera.mode == .video { formatMenu; resolutionMenu }
                     BarButton(system: "arrow.left.and.right.righttriangle.left.righttriangle.right",
                               active: camera.mirrored, help: "Mirror") {
                         withAnimation(.smooth) { camera.mirrored.toggle() }
@@ -233,6 +263,29 @@ struct ContentView: View {
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
         .help("Camera")
+    }
+
+    private var formatMenu: some View {
+        Menu {
+            ForEach(VideoFormat.allCases) { f in
+                Button {
+                    camera.format = f
+                } label: {
+                    if camera.format == f { Label("\(f.label)  —  \(f.detail)", systemImage: "checkmark") }
+                    else { Text("\(f.label)  —  \(f.detail)") }
+                }
+            }
+        } label: {
+            Text(camera.format.compactLabel)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(minWidth: 34, minHeight: 34)
+                .padding(.horizontal, 4)
+                .contentShape(Capsule())
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+        .disabled(camera.isRecording)
+        .transition(.scale(scale: 0.6).combined(with: .opacity))
+        .help("Recording format")
     }
 
     private var resolutionMenu: some View {

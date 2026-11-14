@@ -61,6 +61,10 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     @Published var resolution: VideoResolution = VideoResolution(rawValue: UserDefaults.standard.string(forKey: "videoResolution") ?? "") ?? .p1080 {
         didSet { UserDefaults.standard.set(resolution.rawValue, forKey: "videoResolution") }
     }
+    @Published var format: VideoFormat = VideoFormat(rawValue: UserDefaults.standard.string(forKey: "videoFormat") ?? "") ?? .movH264 {
+        didSet { UserDefaults.standard.set(format.rawValue, forKey: "videoFormat") }
+    }
+    @Published var recordError: String?
     @Published var isRecording = false
     @Published var elapsed: TimeInterval = 0
 
@@ -79,6 +83,9 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     private var recordRatio: CGFloat = 16.0 / 9.0
     private var recordMirror = true
     private var recordResolution: VideoResolution = .p1080
+    private var recordFormat: VideoFormat = .movH264
+    private var framesSeen = 0
+    private var firstFramePTS: CMTime?
     private var recordWithAudio = false
     private var outSize = CGSize(width: 1920, height: 1080)
     private var elapsedTimer: Timer?
@@ -234,9 +241,11 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         recordRatio = captureRatio
         recordMirror = mirrored
         recordResolution = resolution
+        recordFormat = format
+        recordError = nil
         Task { @MainActor in
             let micOK = await AVCaptureDevice.requestAccess(for: .audio)
-            let url = Self.movieURL()
+            let url = Self.movieURL(ext: self.recordFormat.fileExtension)
             self.sessionQueue.async { [self] in
                 session.beginConfiguration()
                 videoOutput.alwaysDiscardsLateVideoFrames = true
@@ -256,6 +265,8 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
                     recordURL = url
                     recordWithAudio = audio
                     writer = nil
+                    framesSeen = 0
+                    firstFramePTS = nil
                     wantsRecording = true
                 }
             }
@@ -314,10 +325,10 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         }
     }
 
-    private static func movieURL() -> URL {
+    private static func movieURL(ext: String) -> URL {
         let dir = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)[0].appendingPathComponent("Macam")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("Macam \(stamp.string(from: Date())).mov")
+        return dir.appendingPathComponent("Macam \(stamp.string(from: Date())).\(ext)")
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -331,32 +342,78 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         }
     }
 
+    /// True when a frame is essentially black (mean brightness under ~6%).
+    private static func isNearlyBlack(_ pixels: CVPixelBuffer) -> Bool {
+        CVPixelBufferLockBaseAddress(pixels, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixels)?.assumingMemoryBound(to: UInt8.self) else { return false }
+        let w = CVPixelBufferGetWidth(pixels), h = CVPixelBufferGetHeight(pixels), stride = CVPixelBufferGetBytesPerRow(pixels)
+        var sum = 0, count = 0
+        for y in Swift.stride(from: 0, to: h, by: 16) {
+            for x in Swift.stride(from: 0, to: w, by: 16) {
+                let p = base + y * stride + x * 4
+                sum += Int(p[0]) + Int(p[1]) + Int(p[2]); count += 3
+            }
+        }
+        return count > 0 && Double(sum) / Double(count) / 255 < 0.06
+    }
+
+    /// Called on the writer queue when the file can't be written: stop and tell the user why.
+    private func failRecording(_ message: String) {
+        wantsRecording = false
+        DispatchQueue.main.async { [self] in
+            elapsedTimer?.invalidate(); elapsedTimer = nil
+            withAnimation(.snappy) { isRecording = false; recordError = message }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(5))
+                if recordError == message { withAnimation(.snappy) { recordError = nil } }
+            }
+        }
+        cleanupOutputs()
+    }
+
     private func appendVideo(_ sample: CMSampleBuffer) {
         guard let pixels = CMSampleBufferGetImageBuffer(sample) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
 
         if writer == nil {
             guard let url = recordURL else { return }
+
+            // The camera hands over a couple of blank frames when outputs are attached. Skip the first
+            // few frames, and keep skipping near-black ones for up to 0.6s, so clips never open on black.
+            framesSeen += 1
+            if firstFramePTS == nil { firstFramePTS = pts }
+            let waited = (pts - (firstFramePTS ?? pts)).seconds
+            if framesSeen <= 3 || (waited < 0.6 && Self.isNearlyBlack(pixels)) { return }
+
             let srcW = CGFloat(CVPixelBufferGetWidth(pixels)), srcH = CGFloat(CVPixelBufferGetHeight(pixels))
             // Fit the crop, then scale so the short side matches the chosen resolution (even dimensions for the encoder).
             var cw = srcW, ch = srcW / recordRatio
             if ch > srcH { ch = srcH; cw = srcH * recordRatio }
-            let scale = recordResolution.shortSide.map { min(1, $0 / min(cw, ch)) } ?? 1
+            var scale = recordResolution.shortSide.map { min(1, $0 / min(cw, ch)) } ?? 1
+            if let limit = recordFormat.maxSide, max(cw, ch) * scale > CGFloat(limit) {
+                scale = CGFloat(limit) / max(cw, ch)
+            }
             let ow = max(2, Int((cw * scale) / 2) * 2), oh = max(2, Int((ch * scale) / 2) * 2)
             outSize = CGSize(width: ow, height: oh)
 
-            guard let w = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return }
-            let v = AVAssetWriterInput(mediaType: .video, outputSettings: [
-                AVVideoCodecKey: min(ow, oh) > 1080 ? AVVideoCodecType.hevc : AVVideoCodecType.h264,
-                AVVideoWidthKey: ow, AVVideoHeightKey: oh,
-                AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: max(6_000_000, ow * oh * 5)],
-            ])
+            let settings = recordFormat.videoSettings(width: ow, height: oh)
+            guard let w = try? AVAssetWriter(outputURL: url, fileType: recordFormat.fileType) else {
+                failRecording("Couldn't create the recording file.")
+                return
+            }
+            guard w.canApply(outputSettings: settings, forMediaType: .video) else {
+                failRecording("This Mac can't record \(recordFormat.label) at \(ow)×\(oh).")
+                return
+            }
+            let v = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
             v.expectsMediaDataInRealTime = true
             let a = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: v, sourcePixelBufferAttributes: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferWidthKey as String: ow, kCVPixelBufferHeightKey as String: oh,
             ])
             if w.canAdd(v) { w.add(v) }
+            audioWriterInput = nil
             if recordWithAudio {
                 let ain = AVAssetWriterInput(mediaType: .audio, outputSettings: [
                     AVFormatIDKey: kAudioFormatMPEG4AAC, AVNumberOfChannelsKey: 1,
@@ -365,7 +422,10 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
                 ain.expectsMediaDataInRealTime = true
                 if w.canAdd(ain) { w.add(ain); audioWriterInput = ain }
             }
-            guard w.startWriting() else { return }
+            guard w.startWriting() else {
+                failRecording("Couldn't start recording in \(recordFormat.label).")
+                return
+            }
             w.startSession(atSourceTime: pts)
             writer = w; videoInput = v; adaptor = a
         }
@@ -389,6 +449,21 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         }
         ciContext.render(image, to: out)
         adaptor.append(out, withPresentationTime: pts)
+    }
+
+    /// Pauses the live camera while the editor is open, and brings it back after.
+    func pause() {
+        sessionQueue.async { [self] in if session.isRunning { session.stopRunning() } }
+    }
+
+    func resume() {
+        guard authorization == .authorized else { return }
+        sessionQueue.async { [self] in if !session.isRunning { session.startRunning() } }
+    }
+
+    /// Shows a newly saved video (e.g. an edited copy) as the latest thumbnail.
+    func registerMovie(_ url: URL) {
+        Task { @MainActor in await showMovieThumbnail(url) }
     }
 
     func revealLastPhoto() {

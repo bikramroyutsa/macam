@@ -10,6 +10,7 @@ struct MacamApp: App {
     @StateObject private var camera = CameraModel()
     @StateObject private var profiles = ProfileStore()
     @StateObject private var prompter = TeleprompterModel()
+    @StateObject private var host = EditorHost()
 
     var body: some Scene {
         WindowGroup {
@@ -17,11 +18,15 @@ struct MacamApp: App {
                 .environmentObject(camera)
                 .environmentObject(profiles)
                 .environmentObject(prompter)
+                .environmentObject(host)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1000, height: 700)
         .commands {
-            CommandGroup(replacing: .newItem) {}
+            CommandGroup(replacing: .newItem) {
+                Button("Open Video to Edit…") { host.openPanel() }
+                    .keyboardShortcut("o", modifiers: .command)
+            }
 
             CommandMenu("Camera") {
                 Button(camera.mode == .video ? (camera.isRecording ? "Stop Recording" : "Record Video") : "Take Photo") { camera.shutter() }
