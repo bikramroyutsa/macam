@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>Macam</string>
+    <key>CFBundleDisplayName</key><string>Macam</string>
+    <key>CFBundleIdentifier</key><string>com.macam.app</string>
+    <key>CFBundleExecutable</key><string>Macam</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>LSApplicationCategoryType</key><string>public.app-category.photography</string>
+    <key>NSCameraUsageDescription</key><string>Macam uses the camera to show your preview and take photos.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Macam listens to your voice so the teleprompter can follow along as you speak or sing.</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>Macam recognises your speech to scroll the teleprompter in sync with you.</string>
+</dict>
+</plist>
