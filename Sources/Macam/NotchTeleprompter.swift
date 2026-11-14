@@ -150,6 +150,23 @@ struct NotchTeleprompterView: View {
             .blur(radius: open ? 0 : 8)
             .animation(open ? .easeOut(duration: 0.35).delay(0.18) : .easeIn(duration: 0.15), value: open)
 
+            // Voice indicator in the band level with the physical notch, one cluster either side of it.
+            if open, notch.height > 0, model.isRunning, model.mode != .scroll {
+                let side = (size.width - notch.width) / 2
+                HStack(spacing: 0) {
+                    VoiceWave(amount: model.voiceAmount, mirrored: true)
+                        .frame(width: max(0, side - 24))
+                        .padding(.trailing, 10).padding(.leading, 14)
+                    Color.clear.frame(width: notch.width)
+                    VoiceWave(amount: model.voiceAmount, mirrored: false)
+                        .frame(width: max(0, side - 24))
+                        .padding(.leading, 10).padding(.trailing, 14)
+                }
+                .frame(width: size.width, height: notch.height)
+                .animation(.linear(duration: 0.06), value: model.voiceAmount)
+                .transition(.opacity)
+            }
+
             if open {
                 ResizeHandle(model: model, axis: .width, visible: hovering)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
@@ -237,6 +254,57 @@ private struct LineText: View {
             result += piece
         }
         return result
+    }
+}
+
+// MARK: Voice indicator
+
+/// A soft wave that radiates out of the notch. Silent: a faint, almost-flat line with a slow ripple.
+/// Speaking: three layered waves swell with your voice and fade out towards the edge.
+/// `amount` (0…1) is animatable, so it glides between the two states.
+private struct VoiceWave: View, Animatable {
+    var amount: Double
+    var mirrored: Bool
+
+    var animatableData: Double {
+        get { amount }
+        set { amount = newValue }
+    }
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            Canvas { ctx, size in
+                let midY = size.height / 2
+                let layers: [(freq: Double, speed: Double, phase: Double, scale: Double, width: CGFloat, opacity: Double)] = [
+                    (1.5, 2.6, 0.0, 1.00, 1.8, 1.00),
+                    (2.3, 3.4, 1.9, 0.62, 1.3, 0.55),
+                    (3.4, 4.6, 4.1, 0.38, 1.0, 0.35),
+                ]
+                let maxAmp = Double(size.height) * 0.5
+                for layer in layers {
+                    var path = Path()
+                    var x = 0.0
+                    while x <= size.width {
+                        let u = x / size.width                                  // 0 at the notch, 1 at the outer edge
+                        let envelope = sin(min(1, u * 5) * .pi / 2) * pow(1 - u, 0.8)
+                        let amp = 0.7 + amount * maxAmp * layer.scale
+                        let y = midY + sin(u * layer.freq * 2 * .pi - t * layer.speed + layer.phase) * amp * envelope
+                        let px = mirrored ? size.width - x : x
+                        if x == 0 { path.move(to: CGPoint(x: px, y: y)) } else { path.addLine(to: CGPoint(x: px, y: y)) }
+                        x += 1.5
+                    }
+                    let near = mirrored ? CGPoint(x: size.width, y: 0) : .zero
+                    let far = mirrored ? .zero : CGPoint(x: size.width, y: 0)
+                    let strength = layer.opacity * (0.30 + 0.70 * amount)
+                    ctx.stroke(path,
+                               with: .linearGradient(Gradient(colors: [.white.opacity(strength), .white.opacity(0)]),
+                                                     startPoint: near, endPoint: far),
+                               style: StrokeStyle(lineWidth: layer.width, lineCap: .round, lineJoin: .round))
+                }
+            }
+        }
+        .frame(height: 24)
     }
 }
 

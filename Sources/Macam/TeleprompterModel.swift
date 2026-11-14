@@ -61,6 +61,8 @@ final class TeleprompterModel: ObservableObject {
     @Published var currentIndex = 0
     @Published var isRunning = false
     @Published var level: Float = 0
+    @Published var voiceAmount: Double = 0   // 0 silent … 1 loud, smoothed (fast attack, slow release)
+    @Published var isSpeaking = false  // voice present right now (with a short hold so it doesn't flicker)
     @Published var status = ""
     @Published var heard = ""          // what the recogniser last heard (diagnostics)
     @Published var vocabStatus = ""    // state of the script-specific language model
@@ -84,6 +86,7 @@ final class TeleprompterModel: ObservableObject {
     private var paceSamples: [(t: Date, idx: Int)] = []
     private var lastVoice = Date.distantPast
     private var vocabTask: Task<Void, Never>?
+    private var lastLoud = Date.distantPast
     private var cancellables = Set<AnyCancellable>()
 
     static let controlsHeight: CGFloat = 40
@@ -135,7 +138,7 @@ final class TeleprompterModel: ObservableObject {
             Task { @MainActor in self?.handleTranscript(words) }
         }
         tracker.onLevel = { [weak self] level in
-            Task { @MainActor in self?.level = level }
+            Task { @MainActor in self?.handleLevel(level) }
         }
         tracker.onNotice = { [weak self] text in
             Task { @MainActor in self?.vocabStatus = text }
@@ -259,6 +262,18 @@ final class TeleprompterModel: ObservableObject {
         tickTask = nil
         isRunning = false
         level = 0
+        isSpeaking = false
+        voiceAmount = 0
+    }
+
+    /// Speaking switches on at a clear level and off only after ~0.4s below it, so brief gaps
+    /// between words don't make the indicator flicker.
+    private func handleLevel(_ newLevel: Float) {
+        level = newLevel
+        if newLevel > 0.04 {
+            lastLoud = Date()
+            if !isSpeaking { isSpeaking = true }
+        }
     }
 
     private func restart() {
@@ -294,6 +309,11 @@ final class TeleprompterModel: ObservableObject {
     private func tick(_ dt: Double) {
         guard isRunning else { return }
         let now = Date()
+        if isSpeaking, now.timeIntervalSince(lastLoud) > 0.4 { isSpeaking = false }
+        // Ease the indicator: quick to rise with your voice, slow to settle when you stop.
+        let target = isSpeaking ? min(1, 0.3 + Double(level) * 2.0) : 0
+        voiceAmount += (target - voiceAmount) * (target > voiceAmount ? 0.45 : 0.14)
+        if abs(voiceAmount - target) < 0.003 { voiceAmount = target }
         switch mode {
         case .scroll:
             advance(speed * dt)
