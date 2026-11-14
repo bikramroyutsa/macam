@@ -42,8 +42,15 @@ final class NotchController {
             self?.setPresented(presented)
         }.store(in: &cancellables)
 
-        // Keep the panel sized to the pill when the font size changes.
+        // Keep the panel sized to the pill when font size, width or line count change.
+        // (@Published emits before the value lands, so hop a runloop turn.)
         model.$fontSize.dropFirst().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.updateFrame() }
+        }.store(in: &cancellables)
+        model.$panelWidth.dropFirst().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.updateFrame() }
+        }.store(in: &cancellables)
+        model.$visibleLines.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { self?.updateFrame() }
         }.store(in: &cancellables)
 
@@ -133,7 +140,7 @@ struct NotchTeleprompterView: View {
             VStack(spacing: 0) {
                 Color.clear.frame(height: notch.height + 8)
                 LinesView(model: model)
-                    .frame(height: model.lineHeight * CGFloat(TeleprompterModel.visibleLines))
+                    .frame(height: model.lineHeight * CGFloat(model.visibleLines))
                 ControlsRow(model: model, hovering: hovering)
                     .frame(height: TeleprompterModel.controlsHeight)
             }
@@ -142,6 +149,13 @@ struct NotchTeleprompterView: View {
             .opacity(open ? 1 : 0)
             .blur(radius: open ? 0 : 8)
             .animation(open ? .easeOut(duration: 0.35).delay(0.18) : .easeIn(duration: 0.15), value: open)
+
+            if open {
+                ResizeHandle(model: model, axis: .width, visible: hovering)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                ResizeHandle(model: model, axis: .height, visible: hovering)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            }
         }
         .frame(width: open ? size.width : notch.width,
                height: open ? size.height : max(notch.height, 1),
@@ -163,24 +177,27 @@ private struct LinesView: View {
     var body: some View {
         let current = model.currentLine
         let lineH = model.lineHeight
-        let range = max(0, current - 2)..<min(model.lines.count, current + 5)
+        let rows = model.visibleLines
+        let anchor = rows >= 3 ? 1 : 0          // row the current line sits on
+        let range = max(0, current - 2)..<min(model.lines.count, current + rows + 2)
+        let fade = rows >= 3 ? 0.84 / Double(rows) : 0.06
 
         ZStack(alignment: .top) {
             ForEach(Array(range), id: \.self) { i in
                 LineText(model: model, line: i)
                     .frame(height: lineH)
-                    .offset(y: CGFloat(i - current + 1) * lineH)
+                    .offset(y: CGFloat(i - current + anchor) * lineH)
                     .onTapGesture { model.jump(toLine: i) }
             }
         }
         .frame(maxWidth: .infinity, alignment: .top)
-        .frame(height: lineH * CGFloat(TeleprompterModel.visibleLines), alignment: .top)
+        .frame(height: lineH * CGFloat(rows), alignment: .top)
         .clipped()
         .mask(
             LinearGradient(stops: [
                 .init(color: .clear, location: 0),
-                .init(color: .black, location: 0.28),
-                .init(color: .black, location: 0.72),
+                .init(color: .black, location: fade),
+                .init(color: .black, location: 1 - fade),
                 .init(color: .clear, location: 1),
             ], startPoint: .top, endPoint: .bottom)
         )
@@ -217,6 +234,34 @@ private struct LineText: View {
             result += piece
         }
         return result
+    }
+}
+
+// MARK: Resize handles
+
+private struct ResizeHandle: View {
+    @ObservedObject var model: TeleprompterModel
+    let axis: TeleprompterModel.ResizeAxis
+    let visible: Bool
+    @StateObject private var hoverBox = Box(false)
+
+    var body: some View {
+        let horizontal = axis == .height   // bottom handle is a horizontal bar
+        Capsule()
+            .fill(.white.opacity(hoverBox.value ? 0.8 : 0.35))
+            .frame(width: horizontal ? 44 : 4, height: horizontal ? 4 : 44)
+            .padding(horizontal ? .vertical : .horizontal, 8)
+            .contentShape(Rectangle())
+            .opacity(visible || hoverBox.value ? 1 : 0)
+            .animation(.smooth(duration: 0.25), value: visible)
+            .animation(.easeOut(duration: 0.15), value: hoverBox.value)
+            .onHover { inside in
+                hoverBox.value = inside
+                if inside { (horizontal ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).push() } else { NSCursor.pop() }
+            }
+            .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                .onChanged { _ in model.resize(axis) })
+            .help(horizontal ? "Drag to change height" : "Drag to change width")
     }
 }
 

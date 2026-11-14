@@ -73,15 +73,23 @@ final class TeleprompterModel: ObservableObject {
     private var fractional = 0.0
     private var cancellables = Set<AnyCancellable>()
 
-    static let panelWidth: CGFloat = 520
-    static let visibleLines = 3
     static let controlsHeight: CGFloat = 40
+    static let minWidth: CGFloat = 360
+    static let maxLines = 8
+
+    /// Width of the notch teleprompter, and how many lines it shows. Both are user-resizable.
+    @Published var panelWidth: CGFloat {
+        didSet { UserDefaults.standard.set(Double(panelWidth), forKey: "panelWidth"); rebuild() }
+    }
+    @Published var visibleLines: Int {
+        didSet { UserDefaults.standard.set(visibleLines, forKey: "visibleLines") }
+    }
 
     var lineHeight: CGFloat { CGFloat(fontSize) * 1.5 }
 
     var pillSize: CGSize {
-        CGSize(width: Self.panelWidth,
-               height: notch.height + 8 + lineHeight * CGFloat(Self.visibleLines) + Self.controlsHeight + 6)
+        CGSize(width: panelWidth,
+               height: notch.height + 8 + lineHeight * CGFloat(visibleLines) + Self.controlsHeight + 6)
     }
 
     var currentLine: Int {
@@ -101,6 +109,10 @@ final class TeleprompterModel: ObservableObject {
         mode = PromptMode(rawValue: d.string(forKey: "promptMode") ?? "") ?? .speech
         let sp = d.double(forKey: "speed")
         speed = sp == 0 ? 2.5 : sp
+        let pw = d.double(forKey: "panelWidth")
+        panelWidth = pw == 0 ? 520 : CGFloat(pw)
+        let vl = d.integer(forKey: "visibleLines")
+        visibleLines = vl == 0 ? 3 : min(max(vl, 1), Self.maxLines)
         rebuild()
 
         tracker.onWords = { [weak self] words in
@@ -118,8 +130,30 @@ final class TeleprompterModel: ObservableObject {
 
     // MARK: Layout
 
+    var maxPanelWidth: CGFloat { min(1100, (notch.screen?.frame.width ?? 1400) - 40) }
+
+    func resetSize() {
+        panelWidth = 520
+        visibleLines = 3
+    }
+
+    enum ResizeAxis { case width, height }
+
+    /// Resizes from the live mouse position: the pill is centred under the notch and hangs from the top edge.
+    func resize(_ axis: ResizeAxis) {
+        guard let frame = notch.screen?.frame else { return }
+        let m = NSEvent.mouseLocation
+        switch axis {
+        case .width:
+            panelWidth = min(max(2 * abs(m.x - frame.midX), Self.minWidth), maxPanelWidth)
+        case .height:
+            let room = frame.maxY - m.y - notch.height - 8 - Self.controlsHeight - 6
+            visibleLines = min(max(Int((room / lineHeight).rounded()), 1), Self.maxLines)
+        }
+    }
+
     private func rebuild() {
-        let contentWidth = Double(Self.panelWidth) - 56
+        let contentWidth = Double(panelWidth) - 56
         let maxChars = max(12, Int(contentWidth / (fontSize * 0.5)))
 
         var newWords: [PromptWord] = []

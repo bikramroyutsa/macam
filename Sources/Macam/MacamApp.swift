@@ -24,7 +24,7 @@ struct MacamApp: App {
             CommandGroup(replacing: .newItem) {}
 
             CommandMenu("Camera") {
-                Button("Take Photo") { camera.shutter() }
+                Button(camera.mode == .video ? (camera.isRecording ? "Stop Recording" : "Record Video") : "Take Photo") { camera.shutter() }
                     .keyboardShortcut(.return, modifiers: .command)
                 Divider()
                 ForEach(Array(profiles.all.enumerated()), id: \.element.id) { i, p in

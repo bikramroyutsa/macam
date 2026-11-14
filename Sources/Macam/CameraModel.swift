@@ -2,7 +2,10 @@ import AVFoundation
 import AppKit
 import SwiftUI
 
-final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate {
+enum CaptureMode: String { case photo, video }
+
+final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate,
+                         AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     private let photoOutput = AVCapturePhotoOutput()
     private let sessionQueue = DispatchQueue(label: "macam.camera.session")
@@ -19,6 +22,29 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     @Published var flash = false
     @Published var countdown: Int?
     @Published var timerSeconds: Int = 0
+    @Published var mode: CaptureMode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "captureMode") ?? "") ?? .photo {
+        didSet { UserDefaults.standard.set(mode.rawValue, forKey: "captureMode") }
+    }
+    @Published var isRecording = false
+    @Published var elapsed: TimeInterval = 0
+
+    // Recording pipeline (writer state is only touched on `writerQueue`).
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let audioOutput = AVCaptureAudioDataOutput()
+    private let writerQueue = DispatchQueue(label: "macam.camera.writer")
+    private let ciContext = CIContext()
+    private var audioInput: AVCaptureDeviceInput?
+    private var writer: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var audioWriterInput: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var wantsRecording = false
+    private var recordURL: URL?
+    private var recordRatio: CGFloat = 16.0 / 9.0
+    private var recordMirror = true
+    private var recordWithAudio = false
+    private var outSize = CGSize(width: 1920, height: 1080)
+    private var elapsedTimer: Timer?
 
     /// Set by the UI so the saved photo matches the framing on screen.
     var captureRatio: CGFloat = 16.0 / 9.0
@@ -86,7 +112,8 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
             self.countdown = nil
             return
         }
-        guard timerSeconds > 0 else { capture(); return }
+        if isRecording { stopRecording(); return }
+        guard timerSeconds > 0 else { trigger(); return }
         countdownTask = Task { @MainActor in
             for n in stride(from: timerSeconds, through: 1, by: -1) {
                 withAnimation(.snappy) { countdown = n }
@@ -94,8 +121,12 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
                 if Task.isCancelled { return }
             }
             withAnimation(.snappy) { countdown = nil }
-            capture()
+            trigger()
         }
+    }
+
+    private func trigger() {
+        if mode == .video { startRecording() } else { capture() }
     }
 
     private func capture() {
@@ -157,6 +188,169 @@ final class CameraModel: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
         ctx.scaleBy(x: -1, y: 1)
         ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: cropped.width, height: cropped.height))
         return ctx.makeImage() ?? cropped
+    }
+
+    // MARK: Video
+
+    private func startRecording() {
+        guard session.isRunning, !isRecording else { return }
+        recordRatio = captureRatio
+        recordMirror = mirrored
+        Task { @MainActor in
+            let micOK = await AVCaptureDevice.requestAccess(for: .audio)
+            let url = Self.movieURL()
+            self.sessionQueue.async { [self] in
+                session.beginConfiguration()
+                videoOutput.alwaysDiscardsLateVideoFrames = true
+                videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+                videoOutput.setSampleBufferDelegate(self, queue: writerQueue)
+                if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
+                var audio = false
+                if micOK, let mic = AVCaptureDevice.default(for: .audio),
+                   let input = try? AVCaptureDeviceInput(device: mic), session.canAddInput(input) {
+                    session.addInput(input)
+                    audioInput = input
+                    audioOutput.setSampleBufferDelegate(self, queue: writerQueue)
+                    if session.canAddOutput(audioOutput) { session.addOutput(audioOutput); audio = true }
+                }
+                session.commitConfiguration()
+                writerQueue.async { [self] in
+                    recordURL = url
+                    recordWithAudio = audio
+                    writer = nil
+                    wantsRecording = true
+                }
+            }
+            withAnimation(.snappy) { self.isRecording = true }
+            self.elapsed = 0
+            let started = Date()
+            self.elapsedTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                self?.elapsed = Date().timeIntervalSince(started)
+            }
+        }
+    }
+
+    func stopRecording() {
+        guard isRecording else { return }
+        elapsedTimer?.invalidate()
+        elapsedTimer = nil
+        withAnimation(.snappy) { isRecording = false }
+        writerQueue.async { [self] in
+            wantsRecording = false
+            guard let writer, let url = recordURL else { cleanupOutputs(); return }
+            self.writer = nil
+            videoInput?.markAsFinished()
+            audioWriterInput?.markAsFinished()
+            writer.finishWriting { [weak self] in
+                self?.cleanupOutputs()
+                Task { @MainActor in await self?.showMovieThumbnail(url) }
+            }
+        }
+    }
+
+    private func cleanupOutputs() {
+        sessionQueue.async { [self] in
+            session.beginConfiguration()
+            videoOutput.setSampleBufferDelegate(nil, queue: nil)
+            audioOutput.setSampleBufferDelegate(nil, queue: nil)
+            session.removeOutput(videoOutput)
+            session.removeOutput(audioOutput)
+            if let audioInput { session.removeInput(audioInput); self.audioInput = nil }
+            session.commitConfiguration()
+        }
+    }
+
+    @MainActor
+    private func showMovieThumbnail(_ url: URL) async {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 400, height: 400)
+        if let result = try? await generator.image(at: .zero) {
+            let image = NSImage(cgImage: result.image, size: NSSize(width: result.image.width, height: result.image.height))
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.7)) {
+                lastPhoto = image
+                lastPhotoURL = url
+            }
+        } else {
+            lastPhotoURL = url
+        }
+    }
+
+    private static func movieURL() -> URL {
+        let dir = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)[0].appendingPathComponent("Macam")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("Macam \(stamp.string(from: Date())).mov")
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard wantsRecording else { return }
+        if output === videoOutput {
+            appendVideo(sampleBuffer)
+        } else if output === audioOutput {
+            if let input = audioWriterInput, writer?.status == .writing, input.isReadyForMoreMediaData {
+                input.append(sampleBuffer)
+            }
+        }
+    }
+
+    private func appendVideo(_ sample: CMSampleBuffer) {
+        guard let pixels = CMSampleBufferGetImageBuffer(sample) else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+
+        if writer == nil {
+            guard let url = recordURL else { return }
+            let srcW = CGFloat(CVPixelBufferGetWidth(pixels)), srcH = CGFloat(CVPixelBufferGetHeight(pixels))
+            // Fit the crop, then cap the long side at 1920 (even dimensions for the encoder).
+            var cw = srcW, ch = srcW / recordRatio
+            if ch > srcH { ch = srcH; cw = srcH * recordRatio }
+            let scale = min(1, 1920 / max(cw, ch))
+            let ow = max(2, Int((cw * scale) / 2) * 2), oh = max(2, Int((ch * scale) / 2) * 2)
+            outSize = CGSize(width: ow, height: oh)
+
+            guard let w = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return }
+            let v = AVAssetWriterInput(mediaType: .video, outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: ow, AVVideoHeightKey: oh,
+                AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: max(6_000_000, ow * oh * 5)],
+            ])
+            v.expectsMediaDataInRealTime = true
+            let a = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: v, sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: ow, kCVPixelBufferHeightKey as String: oh,
+            ])
+            if w.canAdd(v) { w.add(v) }
+            if recordWithAudio {
+                let ain = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC, AVNumberOfChannelsKey: 1,
+                    AVSampleRateKey: 44100, AVEncoderBitRateKey: 128_000,
+                ])
+                ain.expectsMediaDataInRealTime = true
+                if w.canAdd(ain) { w.add(ain); audioWriterInput = ain }
+            }
+            guard w.startWriting() else { return }
+            w.startSession(atSourceTime: pts)
+            writer = w; videoInput = v; adaptor = a
+        }
+
+        guard let input = videoInput, let adaptor, input.isReadyForMoreMediaData,
+              let pool = adaptor.pixelBufferPool else { return }
+        var out: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out)
+        guard let out else { return }
+
+        var image = CIImage(cvPixelBuffer: pixels)
+        let ext = image.extent
+        var cw = ext.width, ch = ext.width / recordRatio
+        if ch > ext.height { ch = ext.height; cw = ext.height * recordRatio }
+        let crop = CGRect(x: ext.midX - cw / 2, y: ext.midY - ch / 2, width: cw, height: ch).integral
+        image = image.cropped(to: crop)
+            .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
+            .transformed(by: CGAffineTransform(scaleX: outSize.width / crop.width, y: outSize.height / crop.height))
+        if recordMirror {
+            image = image.transformed(by: CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: outSize.width, ty: 0))
+        }
+        ciContext.render(image, to: out)
+        adaptor.append(out, withPresentationTime: pts)
     }
 
     func revealLastPhoto() {

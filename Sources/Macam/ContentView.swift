@@ -103,6 +103,11 @@ struct ContentView: View {
         .onChange(of: profiles.selected.ratio, initial: true) { _, new in camera.captureRatio = new }
     }
 
+    static func clock(_ t: TimeInterval) -> String {
+        let s = Int(t)
+        return String(format: "%02d:%02d", s / 60, s % 60)
+    }
+
     static func fit(ratio: CGFloat, in size: CGSize) -> CGSize {
         var w = size.width, h = w / ratio
         if h > size.height { h = size.height; w = h * ratio }
@@ -119,6 +124,21 @@ struct ContentView: View {
             case .authorized:
                 CameraPreview(session: camera.session, mirrored: camera.mirrored, deviceID: camera.currentDeviceID)
                 Color.white.opacity(camera.flash ? 1 : 0).allowsHitTesting(false)
+                if camera.isRecording {
+                    VStack {
+                        HStack(spacing: 7) {
+                            Circle().fill(.red).frame(width: 8, height: 8)
+                            Text(Self.clock(camera.elapsed))
+                                .font(.system(size: 13, weight: .medium).monospacedDigit())
+                                .contentTransition(.numericText())
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .glass(Capsule())
+                        .padding(.top, 14)
+                        Spacer()
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
                 if let n = camera.countdown {
                     Text("\(n)")
                         .font(.system(size: 120, weight: .thin, design: .rounded))
@@ -161,12 +181,14 @@ struct ContentView: View {
                     .id(camera.lastPhotoURL)
                     .transition(.scale(scale: 0.5).combined(with: .opacity))
                 }
+                ModeToggle()
                 Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity)
 
             Button { camera.shutter() } label: { Color.clear }
-                .buttonStyle(ShutterStyle(counting: camera.countdown != nil))
+                .buttonStyle(ShutterStyle(video: camera.mode == .video,
+                                          active: camera.countdown != nil || camera.isRecording))
                 .disabled(camera.authorization != .authorized)
 
             HStack(spacing: 2) {
@@ -258,17 +280,51 @@ struct BarButton: View {
 }
 
 struct ShutterStyle: ButtonStyle {
-    var counting: Bool
+    var video: Bool
+    var active: Bool   // counting down, or recording
     func makeBody(configuration: Configuration) -> some View {
+        let red = video || active
         ZStack {
             Circle().strokeBorder(.white, lineWidth: 3.5).frame(width: 64, height: 64)
-            RoundedRectangle(cornerRadius: counting ? 8 : 25, style: .continuous)
-                .fill(counting ? Color.red : .white)
-                .frame(width: counting ? 26 : 50, height: counting ? 26 : 50)
+            RoundedRectangle(cornerRadius: active ? 8 : 25, style: .continuous)
+                .fill(red ? Color.red : .white)
+                .frame(width: active ? 26 : 50, height: active ? 26 : 50)
                 .scaleEffect(configuration.isPressed ? 0.86 : 1)
         }
         .animation(.spring(response: 0.28, dampingFraction: 0.6), value: configuration.isPressed)
-        .animation(.smooth(duration: 0.3), value: counting)
+        .animation(.smooth(duration: 0.3), value: active)
+        .animation(.smooth(duration: 0.3), value: video)
+    }
+}
+
+struct ModeToggle: View {
+    @EnvironmentObject var camera: CameraModel
+    @Namespace private var ns
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach([CaptureMode.photo, .video], id: \.self) { m in
+                let selected = camera.mode == m
+                Button { camera.mode = m } label: {
+                    Image(systemName: m == .photo ? "camera.fill" : "video.fill")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(selected ? Color.primary : Color.secondary)
+                        .frame(width: 34, height: 30)
+                        .background {
+                            if selected {
+                                Capsule().fill(.white.opacity(0.16)).matchedGeometryEffect(id: "mode", in: ns)
+                            }
+                        }
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .help(m == .photo ? "Photo" : "Video")
+            }
+        }
+        .padding(3)
+        .glass(Capsule())
+        .disabled(camera.isRecording)
+        .animation(.smooth(duration: 0.3), value: camera.mode)
     }
 }
 
@@ -404,6 +460,22 @@ struct ScriptPanel: View {
                 Image(systemName: "textformat.size").foregroundStyle(.secondary).frame(width: 18)
                 Slider(value: $prompter.fontSize, in: 18...48)
             }
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.left.and.right").foregroundStyle(.secondary).frame(width: 18)
+                    Slider(value: $prompter.panelWidth, in: TeleprompterModel.minWidth...prompter.maxPanelWidth)
+                }
+                .help("Notch width")
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.up.and.down").foregroundStyle(.secondary).frame(width: 18)
+                    Stepper("\(prompter.visibleLines) \(prompter.visibleLines == 1 ? "line" : "lines")",
+                            value: $prompter.visibleLines, in: 1...TeleprompterModel.maxLines)
+                    Button("Reset") { prompter.resetSize() }
+                        .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                }
+                .help("Notch height")
+            }
+
             if prompter.mode != .speech {
                 HStack(spacing: 10) {
                     Image(systemName: "speedometer").foregroundStyle(.secondary).frame(width: 18)
