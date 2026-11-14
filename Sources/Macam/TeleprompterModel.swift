@@ -96,7 +96,7 @@ final class TeleprompterModel: ObservableObject {
 
     var pillSize: CGSize {
         CGSize(width: panelWidth,
-               height: notch.height + 8 + lineHeight * CGFloat(visibleLines) + Self.controlsHeight + 6)
+               height: notch.height + 2 + lineHeight * CGFloat(visibleLines) + Self.controlsHeight + 6)
     }
 
     /// The line the view scrolls to. It leads the highlighted word by about half a second of

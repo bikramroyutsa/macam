@@ -138,7 +138,7 @@ struct NotchTeleprompterView: View {
                 .fill(.black)
 
             VStack(spacing: 0) {
-                Color.clear.frame(height: notch.height + 8)
+                Color.clear.frame(height: notch.height + 2)
                 LinesView(model: model)
                     .frame(height: model.lineHeight * CGFloat(model.visibleLines))
                 ControlsRow(model: model, hovering: hovering)
@@ -178,9 +178,12 @@ private struct LinesView: View {
         let current = model.currentLine
         let lineH = model.lineHeight
         let rows = model.visibleLines
-        let anchor = rows >= 3 ? 1 : 0          // row the current line sits on
+        // Row the current line sits on: the first row at the very start (nothing above it yet),
+        // then the second row so the line you just read stays visible above.
+        let anchor = rows >= 3 && current > 0 ? 1 : 0
         let range = max(0, current - 2)..<min(model.lines.count, current + rows + 2)
         let fade = rows >= 3 ? 0.84 / Double(rows) : 0.06
+        let topFade = anchor == 0 ? 0 : fade
 
         ZStack(alignment: .top) {
             ForEach(Array(range), id: \.self) { i in
@@ -195,8 +198,8 @@ private struct LinesView: View {
         .clipped()
         .mask(
             LinearGradient(stops: [
-                .init(color: .clear, location: 0),
-                .init(color: .black, location: fade),
+                .init(color: topFade == 0 ? .black : .clear, location: 0),
+                .init(color: .black, location: topFade),
                 .init(color: .black, location: 1 - fade),
                 .init(color: .clear, location: 1),
             ], startPoint: .top, endPoint: .bottom)
