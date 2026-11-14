@@ -9,6 +9,35 @@
   Any aspect ratio, a teleprompter that lives in the notch and follows your voice, and a small video editor.
 </p>
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/camera.png" alt="Camera view at 16:9 with aspect ratio picker, photo and video toggle, and shutter">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/notch-teleprompter.png" alt="The teleprompter in the notch, following a spoken script with a voice wave on either side">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/editor.png" alt="Video editor with a timeline split into parts: one slowed, one removed, one sped up">
+</p>
+
+<details>
+<summary>More</summary>
+
+<p align="center">
+  <img src="docs/screenshots/vertical-script.png" alt="A 9:16 vertical frame with the script panel open">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/recording.png" alt="Recording at 4:3 with the timer, format and resolution controls">
+</p>
+
+</details>
+
+<sub>Illustrations of the interface with generated sample content in place of a camera feed. The real app uses macOS's translucent glass for its panels and bars.</sub>
+
 ## Features
 
 **Camera**
