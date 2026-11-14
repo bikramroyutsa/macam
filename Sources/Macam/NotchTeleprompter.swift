@@ -201,7 +201,7 @@ private struct LinesView: View {
                 .init(color: .clear, location: 1),
             ], startPoint: .top, endPoint: .bottom)
         )
-        .animation(.smooth(duration: 0.45), value: current)
+        .animation(.smooth(duration: 0.3), value: current)
     }
 }
 

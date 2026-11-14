@@ -10,6 +10,13 @@ final class SpeechTracker {
     private var task: SFSpeechRecognitionTask?
     private var running = false
     private var smoothedLevel: Float = 0
+    private var contextStrings: [String] = []
+    private let contextLock = NSLock()
+
+    /// Words the recogniser should favour (the upcoming script).
+    func setContext(_ words: [String]) {
+        contextLock.lock(); contextStrings = words; contextLock.unlock()
+    }
 
     var onWords: (@Sendable ([String]) -> Void)?
     var onLevel: (@Sendable (Float) -> Void)?
@@ -65,6 +72,7 @@ final class SpeechTracker {
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
         req.taskHint = .dictation
+        contextLock.lock(); req.contextualStrings = contextStrings; contextLock.unlock()
         if recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
         request = req
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in

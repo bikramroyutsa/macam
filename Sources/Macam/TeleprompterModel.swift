@@ -71,6 +71,13 @@ final class TeleprompterModel: ObservableObject {
     private var tickTask: Task<Void, Never>?
     private var lastMatch = Date.distantPast
     private var fractional = 0.0
+
+    // Pace tracking: the recogniser reports words ~0.5s late, so we learn how fast the
+    // speaker moves and run slightly ahead of it, then snap back to what it confirms.
+    private var confirmedIndex = 0
+    private var learnedPace = 2.5                        // words per second
+    private var paceSamples: [(t: Date, idx: Int)] = []
+    private var lastVoice = Date.distantPast
     private var cancellables = Set<AnyCancellable>()
 
     static let controlsHeight: CGFloat = 40
@@ -92,9 +99,12 @@ final class TeleprompterModel: ObservableObject {
                height: notch.height + 8 + lineHeight * CGFloat(visibleLines) + Self.controlsHeight + 6)
     }
 
+    /// The line the view scrolls to. It leads the highlighted word by about half a second of
+    /// speech, so the next line is already in place before you reach the end of this one.
     var currentLine: Int {
         guard !lineOfWord.isEmpty else { return 0 }
-        return lineOfWord[min(currentIndex, lineOfWord.count - 1)]
+        let lead = visibleLines >= 3 && mode != .scroll ? min(4, Int((learnedPace * 0.6).rounded()) + 1) : 0
+        return lineOfWord[min(currentIndex + lead, lineOfWord.count - 1)]
     }
 
     var progress: Double {
@@ -200,6 +210,8 @@ final class TeleprompterModel: ObservableObject {
         status = ""
         if !isPresented { isPresented = true }
         if currentIndex >= words.count - 1 { currentIndex = 0 }
+        confirmedIndex = currentIndex
+        tracker.setContext(contextWords())   // before the recogniser starts, so the first task has it
         if mode != .scroll {
             guard await SpeechTracker.requestAuthorization() else {
                 status = "Allow Microphone and Speech Recognition in System Settings."
@@ -212,6 +224,11 @@ final class TeleprompterModel: ObservableObject {
         }
         lastMatch = Date()
         fractional = 0
+        confirmedIndex = currentIndex
+        learnedPace = speed
+        paceSamples = []
+        lastVoice = .distantPast
+        tracker.setContext(contextWords())
         isRunning = true
         startTicker()
     }
@@ -231,12 +248,16 @@ final class TeleprompterModel: ObservableObject {
 
     func reset() {
         currentIndex = 0
+        confirmedIndex = 0
         fractional = 0
+        paceSamples = []
     }
 
     func jump(toLine line: Int) {
         guard line >= 0, line < lines.count, let first = lines[line].first else { return }
         currentIndex = first
+        confirmedIndex = first
+        paceSamples = []
     }
 
     private func startTicker() {
@@ -252,15 +273,24 @@ final class TeleprompterModel: ObservableObject {
 
     private func tick(_ dt: Double) {
         guard isRunning else { return }
+        let now = Date()
         switch mode {
         case .scroll:
             advance(speed * dt)
-        case .song:
-            // Lyrics are sung, held and ornamented; recognition drops out a lot.
-            // While there's sound but no recent word match, keep drifting forward.
-            if level > 0.04, Date().timeIntervalSince(lastMatch) > 2.5 { advance(speed * dt) }
-        case .speech:
-            break
+        case .speech, .song:
+            if level > 0.02 { lastVoice = now }
+            // Dead-reckon between recogniser updates: while the voice is active, keep moving at the
+            // learned pace, but never more than a few words past what has been confirmed.
+            let voiceActive = now.timeIntervalSince(lastVoice) < 0.4
+            let recent = now.timeIntervalSince(lastMatch) < 3
+            let song = mode == .song
+            let maxLead = max(3, Int((learnedPace * (song ? 2.5 : 1.2)).rounded()))
+            if voiceActive, recent, currentIndex < confirmedIndex + maxLead {
+                advance(learnedPace * dt)
+            } else if song, voiceActive, !recent {
+                // Recognition has dropped out entirely (sustained notes, ornamentation): keep drifting.
+                advance(learnedPace * dt)
+            }
         }
     }
 
@@ -271,6 +301,7 @@ final class TeleprompterModel: ObservableObject {
         fractional -= Double(whole)
         let next = currentIndex + whole
         if next >= words.count { currentIndex = max(0, words.count - 1); stop() } else { currentIndex = next }
+        if mode == .scroll { confirmedIndex = currentIndex }
     }
 
     // MARK: Following the voice
@@ -282,8 +313,9 @@ final class TeleprompterModel: ObservableObject {
 
         let song = mode == .song
         let lookAhead = song ? 90 : 30
-        let lo = max(0, currentIndex - 4)
-        let hi = min(words.count - 1, currentIndex + lookAhead)
+        let base = confirmedIndex
+        let lo = max(0, base - 4)
+        let hi = min(words.count - 1, base + lookAhead)
         guard lo <= hi else { return }
 
         var best: (pos: Int, score: Int, dist: Int)?
@@ -297,7 +329,7 @@ final class TeleprompterModel: ObservableObject {
                 if Self.fuzzyEqual(tail[t], target) { score += 1; t -= 1; w -= 1 } else { break }
             }
             guard score > 0 else { continue }
-            let dist = abs(p + 1 - currentIndex)
+            let dist = abs(p + 1 - base)
             let near = song ? 10 : 4
             let needed = dist <= near ? 1 : 2
             guard score >= needed else { continue }
@@ -310,12 +342,46 @@ final class TeleprompterModel: ObservableObject {
 
         guard let best else { return }
         let target = min(best.pos + 1, words.count - 1)
-        if target > currentIndex || best.score >= 3 {
+        let now = Date()
+        lastMatch = now
+
+        if target > confirmedIndex {
+            confirmedIndex = target
+            recordPace(index: target, at: now)
+            // Never pull the display backwards for a forward match: we may be running ahead on purpose.
+            if target > currentIndex { currentIndex = target; fractional = 0 }
+            if confirmedIndex % 12 == 0 { tracker.setContext(contextWords()) }
+        } else if best.score >= 3, target < confirmedIndex - 2 {
+            // Clear evidence the speaker went back (re-reading a line): follow them.
+            confirmedIndex = target
             currentIndex = target
             fractional = 0
+            paceSamples = []
         }
-        lastMatch = Date()
         if best.pos >= words.count - 1 { stop() }
+    }
+
+    /// Words per second over the last few seconds of confirmed progress.
+    private func recordPace(index: Int, at time: Date) {
+        paceSamples.append((time, index))
+        paceSamples.removeAll { time.timeIntervalSince($0.t) > 6 }
+        guard let first = paceSamples.first, let last = paceSamples.last else { return }
+        let span = last.t.timeIntervalSince(first.t)
+        guard span >= 1.0, last.idx > first.idx else { return }
+        let measured = Double(last.idx - first.idx) / span
+        let clamped = min(7, max(0.8, measured))
+        learnedPace = learnedPace * 0.5 + clamped * 0.5
+    }
+
+    /// Distinct upcoming words, handed to the recogniser so it prefers them over similar-sounding ones.
+    private func contextWords() -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for w in words[min(confirmedIndex, words.count)...] where !w.norm.isEmpty {
+            if seen.insert(w.norm).inserted { out.append(w.norm) }
+            if out.count >= 100 { break }
+        }
+        return out
     }
 
     private static func fuzzyEqual(_ a: String, _ b: String) -> Bool {
