@@ -499,7 +499,7 @@ struct ScriptPanel: View {
                 .help("Notch height")
             }
 
-            if prompter.mode != .speech {
+            if prompter.mode == .scroll {
                 HStack(spacing: 10) {
                     Image(systemName: "speedometer").foregroundStyle(.secondary).frame(width: 18)
                     Slider(value: $prompter.speed, in: 0.5...6)
@@ -528,6 +528,17 @@ struct ScriptPanel: View {
 
             if !prompter.status.isEmpty {
                 Text(prompter.status).font(.caption).foregroundStyle(.orange)
+            }
+            if prompter.mode != .scroll {
+                VStack(alignment: .leading, spacing: 4) {
+                    if prompter.isRunning {
+                        Text(prompter.heard.isEmpty ? "Listening…" : "Heard: \(prompter.heard)")
+                            .lineLimit(2)
+                    }
+                    if !prompter.vocabStatus.isEmpty { Text(prompter.vocabStatus) }
+                }
+                .font(.caption2).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .padding(16)

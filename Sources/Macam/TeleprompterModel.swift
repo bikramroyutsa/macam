@@ -1,5 +1,6 @@
-import SwiftUI
 import Combine
+import Speech
+import SwiftUI
 
 enum PromptMode: String, CaseIterable, Identifiable {
     case speech = "Speech"   // strict: follows what you say
@@ -11,7 +12,7 @@ enum PromptMode: String, CaseIterable, Identifiable {
     var blurb: String {
         switch self {
         case .speech: "Follows your voice word by word."
-        case .song: "Follows lyrics loosely and keeps moving while you play."
+        case .song: "Follows the words you sing, loosely. Holds still when you stop."
         case .scroll: "Scrolls at a steady pace. No microphone."
         }
     }
@@ -20,6 +21,7 @@ enum PromptMode: String, CaseIterable, Identifiable {
 struct PromptWord {
     let text: String
     let norm: String
+    let key: String      // phonetic key of `norm`
 }
 
 @MainActor
@@ -36,7 +38,7 @@ final class TeleprompterModel: ObservableObject {
 
     // Script & layout
     @Published var script: String {
-        didSet { UserDefaults.standard.set(script, forKey: "script"); rebuild() }
+        didSet { UserDefaults.standard.set(script, forKey: "script"); rebuild(); prepareVocabulary() }
     }
     @Published var fontSize: Double {
         didSet { UserDefaults.standard.set(fontSize, forKey: "fontSize"); rebuild() }
@@ -44,6 +46,7 @@ final class TeleprompterModel: ObservableObject {
     @Published var mode: PromptMode {
         didSet {
             UserDefaults.standard.set(mode.rawValue, forKey: "promptMode")
+            if mode != .scroll, oldValue == .scroll { prepareVocabulary() }
             if isRunning { restart() }
         }
     }
@@ -59,6 +62,8 @@ final class TeleprompterModel: ObservableObject {
     @Published var isRunning = false
     @Published var level: Float = 0
     @Published var status = ""
+    @Published var heard = ""          // what the recogniser last heard (diagnostics)
+    @Published var vocabStatus = ""    // state of the script-specific language model
 
     // Presentation
     @Published var showScript = false      // script editor panel in the main window
@@ -78,6 +83,7 @@ final class TeleprompterModel: ObservableObject {
     private var learnedPace = 2.5                        // words per second
     private var paceSamples: [(t: Date, idx: Int)] = []
     private var lastVoice = Date.distantPast
+    private var vocabTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
     static let controlsHeight: CGFloat = 40
@@ -131,6 +137,13 @@ final class TeleprompterModel: ObservableObject {
         tracker.onLevel = { [weak self] level in
             Task { @MainActor in self?.level = level }
         }
+        tracker.onNotice = { [weak self] text in
+            Task { @MainActor in self?.vocabStatus = text }
+        }
+        tracker.onFatal = { [weak self] text in
+            Task { @MainActor in self?.stop(); self?.status = text }
+        }
+        prepareVocabulary()
     }
 
     func installNotch() {
@@ -182,7 +195,8 @@ final class TeleprompterModel: ObservableObject {
                 if count > 0, count + 1 + token.count > maxChars {
                     newLines.append(current); current = []; count = 0
                 }
-                newWords.append(PromptWord(text: token, norm: Self.normalize(token)))
+                let norm = Self.normalize(token)
+                newWords.append(PromptWord(text: token, norm: norm, key: Phonetics.key(norm)))
                 lineMap.append(newLines.count)
                 current.append(newWords.count - 1)
                 count += token.count + (count > 0 ? 1 : 0)
@@ -195,8 +209,14 @@ final class TeleprompterModel: ObservableObject {
         currentIndex = min(currentIndex, max(0, newWords.count - 1))
     }
 
+    /// Lower-case letters and digits only. A bare number is spelled out so "2" and "two" compare equal.
     static func normalize(_ s: String) -> String {
-        String(s.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
+        let lower = s.lowercased()
+        if !lower.isEmpty, lower.allSatisfy(\.isNumber), let n = Int(lower) {
+            let spelled = NumberFormatter.localizedString(from: NSNumber(value: n), number: .spellOut)
+            return String(spelled.lowercased().filter(\.isLetter))
+        }
+        return String(lower.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
     }
 
     // MARK: Playback
@@ -279,16 +299,14 @@ final class TeleprompterModel: ObservableObject {
             advance(speed * dt)
         case .speech, .song:
             if level > 0.02 { lastVoice = now }
-            // Dead-reckon between recogniser updates: while the voice is active, keep moving at the
-            // learned pace, but never more than a few words past what has been confirmed.
-            let voiceActive = now.timeIntervalSince(lastVoice) < 0.4
-            let recent = now.timeIntervalSince(lastMatch) < 3
+            // Dead-reckon between recogniser updates, but only just past the last word it actually
+            // heard. Nothing moves on its own: no recognised words, no progress. (A guitar alone
+            // makes sound too, so loudness is never treated as "you are singing".)
             let song = mode == .song
-            let maxLead = max(3, Int((learnedPace * (song ? 2.5 : 1.2)).rounded()))
+            let voiceActive = now.timeIntervalSince(lastVoice) < 0.4
+            let recent = now.timeIntervalSince(lastMatch) < (song ? 1.2 : 3)
+            let maxLead = song ? max(2, Int(learnedPace.rounded())) : max(2, Int((learnedPace * 0.7).rounded()))
             if voiceActive, recent, currentIndex < confirmedIndex + maxLead {
-                advance(learnedPace * dt)
-            } else if song, voiceActive, !recent {
-                // Recognition has dropped out entirely (sustained notes, ornamentation): keep drifting.
                 advance(learnedPace * dt)
             }
         }
@@ -308,36 +326,29 @@ final class TeleprompterModel: ObservableObject {
 
     private func handleTranscript(_ transcript: [String]) {
         guard isRunning, !words.isEmpty else { return }
-        let tail = transcript.suffix(5).map(Self.normalize).filter { !$0.isEmpty }
-        guard !tail.isEmpty else { return }
+        heard = transcript.suffix(8).joined(separator: " ")
+
+        let heardWords = transcript.suffix(6).map(Self.normalize).filter { !$0.isEmpty }
+        guard !heardWords.isEmpty else { return }
+        let tail = heardWords.map { (w: $0, k: Phonetics.key($0)) }
 
         let song = mode == .song
         let lookAhead = song ? 90 : 30
+        let near = song ? 14 : 4
         let base = confirmedIndex
         let lo = max(0, base - 4)
         let hi = min(words.count - 1, base + lookAhead)
         guard lo <= hi else { return }
 
-        var best: (pos: Int, score: Int, dist: Int)?
+        // Score every plausible "last word heard" position; nearer positions need less evidence.
+        var best: (pos: Int, score: Double, rank: Double)?
         for p in lo...hi {
-            var score = 0
-            var t = tail.count - 1
-            var w = p
-            while t >= 0, w >= 0 {
-                let target = words[w].norm
-                if target.isEmpty { w -= 1; continue }
-                if Self.fuzzyEqual(tail[t], target) { score += 1; t -= 1; w -= 1 } else { break }
-            }
-            guard score > 0 else { continue }
             let dist = abs(p + 1 - base)
-            let near = song ? 10 : 4
-            let needed = dist <= near ? 1 : 2
+            let score = alignmentScore(tail: tail, endingAt: p)
+            let needed = dist <= 2 ? 0.4 : (dist <= near ? 0.75 : 1.7)
             guard score >= needed else { continue }
-            if let b = best {
-                if score > b.score || (score == b.score && dist < b.dist) { best = (p, score, dist) }
-            } else {
-                best = (p, score, dist)
-            }
+            let rank = score - 0.03 * Double(dist)
+            if best == nil || rank > best!.rank { best = (p, score, rank) }
         }
 
         guard let best else { return }
@@ -351,7 +362,7 @@ final class TeleprompterModel: ObservableObject {
             // Never pull the display backwards for a forward match: we may be running ahead on purpose.
             if target > currentIndex { currentIndex = target; fractional = 0 }
             if confirmedIndex % 12 == 0 { tracker.setContext(contextWords()) }
-        } else if best.score >= 3, target < confirmedIndex - 2 {
+        } else if best.score >= 2.5, target < confirmedIndex - 2 {
             // Clear evidence the speaker went back (re-reading a line): follow them.
             confirmedIndex = target
             currentIndex = target
@@ -359,6 +370,60 @@ final class TeleprompterModel: ObservableObject {
             paceSamples = []
         }
         if best.pos >= words.count - 1 { stop() }
+    }
+
+    /// Aligns the recently heard words against the script words ending at `p`, tolerating words the
+    /// recogniser got wrong (substitutions), dropped or invented. The start of both sides is free,
+    /// so only the quality of the overlap counts, and the last heard word anchors the end.
+    private func alignmentScore(tail: [(w: String, k: String)], endingAt p: Int) -> Double {
+        let n = tail.count
+        let m = min(p + 1, n + 2)
+        let first = p - m + 1
+        let gap = 0.45
+
+        var prev = [Double](repeating: 0, count: m + 1)
+        for i in 1...n {
+            var cur = [Double](repeating: 0, count: m + 1)
+            for j in 1...m {
+                let sw = words[first + j - 1]
+                if sw.norm.isEmpty {                  // punctuation-only token: skip it for free
+                    cur[j] = max(cur[j - 1], prev[j - 1])
+                    continue
+                }
+                let sim = Phonetics.similarity(heard: tail[i - 1].w, heardKey: tail[i - 1].k,
+                                               script: sw.norm, scriptKey: sw.key, last: i == n)
+                cur[j] = max(prev[j - 1] + sim, prev[j] - gap, cur[j - 1] - gap)
+            }
+            prev = cur
+        }
+        return prev[m]
+    }
+
+    // MARK: Vocabulary
+
+    /// Builds a language model from the script so recognition favours the words you are about to read.
+    /// Debounced, and applied to the recogniser as soon as it is ready.
+    private func prepareVocabulary() {
+        vocabTask?.cancel()
+        guard mode != .scroll else { return }
+        let text = script
+        vocabTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard let self, !Task.isCancelled else { return }
+            self.vocabStatus = "Learning your script…"
+            let locale = SFSpeechRecognizer(locale: Locale.current)?.locale ?? SFSpeechRecognizer()?.locale ?? Locale(identifier: "en_US")
+            do {
+                let config = try await ScriptLanguageModel.prepare(script: text, locale: locale)
+                guard !Task.isCancelled else { return }
+                self.tracker.setLanguageModel(config)
+                self.vocabStatus = "Script vocabulary ready"
+                if self.isRunning { self.tracker.restartTask() }
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.tracker.setLanguageModel(nil)
+                self.vocabStatus = ""
+            }
+        }
     }
 
     /// Words per second over the last few seconds of confirmed progress.
@@ -382,26 +447,5 @@ final class TeleprompterModel: ObservableObject {
             if out.count >= 100 { break }
         }
         return out
-    }
-
-    private static func fuzzyEqual(_ a: String, _ b: String) -> Bool {
-        if a == b { return true }
-        let (la, lb) = (a.count, b.count)
-        if min(la, lb) >= 4, a.hasPrefix(b) || b.hasPrefix(a) { return true }
-        if min(la, lb) >= 5, abs(la - lb) <= 1 { return editDistance(a, b) <= 1 }
-        return false
-    }
-
-    private static func editDistance(_ a: String, _ b: String) -> Int {
-        let a = Array(a), b = Array(b)
-        var prev = Array(0...b.count)
-        for i in 1...max(1, a.count) where a.count > 0 {
-            var cur = [i] + Array(repeating: 0, count: b.count)
-            for j in 1...max(1, b.count) where b.count > 0 {
-                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1))
-            }
-            prev = cur
-        }
-        return prev[b.count]
     }
 }
